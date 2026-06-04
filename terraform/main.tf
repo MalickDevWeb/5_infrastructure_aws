@@ -4,81 +4,73 @@
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "5.0.0"
-
   name = "production-vpc"
   cidr = "10.0.0.0/16"
 
-  # Haute Disponibilité : 3 Zones de Disponibilité (AZs)
   azs             = ["eu-west-3a", "eu-west-3b", "eu-west-3c"]
   private_subnets = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
   public_subnets  = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
 
-  # Sécurité : Les instances dans les subnets privés accèdent à internet via des NAT Gateways
   enable_nat_gateway = true
-  single_nat_gateway = false # Un NAT par AZ pour éliminer le Single Point of Failure (SPOF)
+  single_nat_gateway = false
   enable_vpn_gateway = false
+}
 
-  tags = {
-    Environment = "Production"
-    ManagedBy   = "Terraform"
-    Project     = "Core-Platform"
+# ==========================================
+# IAM ROLES FOR SERVICE ACCOUNTS (IRSA) - Securité Zero Trust
+# ==========================================
+# Permet au Pod Kubernetes (EKS) d'accéder à S3 SANS clés d'accès codées en dur !
+module "iam_eks_role" {
+  source    = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
+  role_name = "prod-app-s3-access-role"
+  
+  attach_s3_readwrite_policy = true
+  
+  oidc_providers = {
+    main = {
+      # provider_arn               = module.eks.oidc_provider_arn
+      # namespace_service_accounts = ["default:app-service-account"]
+    }
   }
 }
 
 # ==========================================
-# BASE DE DONNÉES RDS POSTGRESQL (Multi-AZ)
+# AMAZON RDS POSTGRESQL (Graviton - ARM Architecture)
 # ==========================================
-resource "aws_db_instance" "postgres_production" {
+resource "aws_db_instance" "postgres" {
   identifier           = "prod-postgres-db"
   allocated_storage    = 100
-  storage_type         = "gp3" # SSD ultra-rapide nouvelle génération
+  storage_type         = "gp3" # SSD IOPS provisionnés - Performance constante
   engine               = "postgres"
   engine_version       = "15.4"
-  
-  # FinOps & Green IT : Graviton (ARM) pour un meilleur ratio Perf/Watt
-  instance_class       = "db.t4g.large" 
-  
+  instance_class       = "db.t4g.large" # AWS Graviton (Processeur ARM: Moins énergivore = Green IT & FinOps)
   username             = "admin_user"
-  password             = var.db_password # DevSecOps: Injecté via AWS Secrets Manager en CI/CD
+  password             = var.db_password # Transmis via Secrets Manager
   parameter_group_name = "default.postgres15"
   
-  # Bonnes pratiques AWS
-  multi_az               = true  # Réplication asynchrone sur une autre AZ pour la résilience
-  publicly_accessible    = false # Zero Trust: Accessible uniquement depuis le VPC privé
+  multi_az               = true  # Failover automatique vers une autre Availability Zone
+  publicly_accessible    = false # Isolation réseau stricte
   vpc_security_group_ids = [aws_security_group.db_sg.id]
-  db_subnet_group_name   = module.vpc.database_subnet_group_name
-  
-  storage_encrypted      = true  # Chiffrement KMS At-Rest
-  skip_final_snapshot    = false
-  backup_retention_period = 7    # Sauvegardes gardées pendant 7 jours
+  storage_encrypted      = true  # KMS Encryption at rest (Norme sécurité entreprise)
 }
 
 # ==========================================
-# SECURITY GROUPS (Zero Trust Architecture)
+# SECURITY GROUPS (Règles de Firewall Cloud)
 # ==========================================
 resource "aws_security_group" "db_sg" {
-  name        = "prod-database-sg"
-  description = "Autorise uniquement le trafic depuis l'application ECS/EKS"
+  name        = "prod-db-sg"
   vpc_id      = module.vpc.vpc_id
 
   ingress {
-    description     = "PostgreSQL access from Application Security Group"
     from_port       = 5432
     to_port         = 5432
     protocol        = "tcp"
+    # Autorise UNIQUEMENT le flux provenant des instances du LoadBalancer/App
     security_groups = [aws_security_group.app_sg.id]
   }
 }
 
 resource "aws_security_group" "app_sg" {
-  name        = "prod-application-sg"
-  description = "Autorise le trafic entrant depuis l'ALB"
-  vpc_id      = module.vpc.vpc_id
-  # Les règles d'ingress HTTP(S) seraient configurées ici...
-}
-
-variable "db_password" {
-  description = "Mot de passe de la DB. Ne jamais coder en dur (Injecté via Jenkins ou Vault)."
-  type        = string
-  sensitive   = true
+  name   = "prod-app-sg"
+  vpc_id = module.vpc.vpc_id
 }
